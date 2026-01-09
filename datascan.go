@@ -684,16 +684,16 @@ func runAllTests(base string, selectedParams []string) []string {
 				}
 			}
 
-			// -------- Traversal SOMENTE para:
-			//  - XSS básico com payload %27%22teste
-			if tc.ID == 1 && tc.Name == "XSS" && payload == `%27%22teste` {
-				if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
-					if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
-						results = append(results, res)
-					}
-				}
-			}
-			//  - Open redirect com payload https://example.com
+			// -------- REMOVIDO: Traversal para XSS com %27%22teste --------
+			// if tc.ID == 1 && tc.Name == "XSS" && payload == `%27%22teste` {
+			// 	if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
+			// 		if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
+			// 			results = append(results, res)
+			// 		}
+			// 	}
+			// }
+			
+			// -------- Traversal APENAS para Open redirect com payload https://example.com --------
 			if tc.ID == 3 && payload == `https://example.com` {
 				if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
 					if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
@@ -756,7 +756,7 @@ func doRequestAndDetect(client *http.Client, method, fullURL string, tc TestCase
 	vul, det := tc.Detector(method, fullURL, resp, body, sentBody)
 
 	if vul {
-		// APENAS resultados vulneráveis (em vermelho)
+		// Vulnerável - em vermelho
 		if method == "POST" && sentBody != "" {
 			if det != "" {
 				det += " "
@@ -766,7 +766,15 @@ func doRequestAndDetect(client *http.Client, method, fullURL string, tc TestCase
 		return formatVuln(tc.Name, method, fullURL, det)
 	}
 
-	// NÃO mostra "Not Vulnerable" - removido completamente
+	// Não vulnerável - normal (sem cor)
+	if !onlyPOC {
+		msg := formatNotVuln(tc.Name, method, fullURL)
+		if method == "POST" && sentBody != "" {
+			msg += " [body:" + sentBody + "]"
+		}
+		return msg
+	}
+
 	return ""
 }
 
@@ -948,9 +956,23 @@ func readBodyDecodedLimit(resp *http.Response, max int64) ([]byte, error) {
 }
 
 func formatVuln(kind, method, urlStr, detail string) string {
-	// APENAS resultados vulneráveis (em vermelho)
-	// Formato: Vulnerable [XSS] - URL
-	return fmt.Sprintf("%sVulnerable [%s] - %s%s", colorRed, kind, urlStr, colorReset)
+	// Vulnerável - em vermelho
+	if onlyPOC {
+		return fmt.Sprintf("%s%s | %s%s", colorRed, urlStr, kind, colorReset)
+	}
+	msg := fmt.Sprintf("Vulnerable [%s] - %s %s", kind, method, urlStr)
+	if detail != "" {
+		msg += " | " + detail
+	}
+	return colorRed + msg + colorReset
+}
+
+func formatNotVuln(kind, method, urlStr string) string {
+	if onlyPOC {
+		return ""
+	}
+	// Não vulnerável - normal (sem cor)
+	return fmt.Sprintf("Not Vulnerable [%s] - %s %s", kind, method, urlStr)
 }
 
 func parseScanOptions(opt string) map[int]bool {
