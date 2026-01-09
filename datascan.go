@@ -26,6 +26,7 @@ const (
 	MaxParamsPerCluster = 80
 	MaxClusters         = 10
 	MaxTotalParams      = MaxParamsPerCluster * MaxClusters
+	MaxVulnsPerEndpoint = 4
 )
 
 // -------------------- Tipos e flags --------------------
@@ -53,6 +54,7 @@ var (
 	workers       int
 	paramMap      map[string][]string
 	endpointList  []string
+	requestTypes  string // Nova flag para escolher tipos de request
 )
 
 // ANSI colors
@@ -82,6 +84,7 @@ func init() {
 		"   5 = SSTI\n"+
 		"   6 = Path Traversal")
 	flag.IntVar(&workers, "w", 0, "Workers para processamento paralelo (default: CPUs * 2)")
+	flag.StringVar(&requestTypes, "r", "get,post", "Request types: get,post or both (default: get,post)")
 
 	flag.Usage = func() {
 		fmt.Println(`
@@ -90,6 +93,7 @@ Usage:
   -lp       List of parameters in txt file (formato: endpoint: [param1, param2] [count])
   -params   Number of parameters to inject (random sample, clusterbomb)
   -o        Scan options (e.g. -o 1,2,3)
+  -r        Request types: get,post or both (default: get,post)
   
   PATH + PARAMETER FUZZING:
   -le       Path to endpoint/path wordlist file
@@ -97,6 +101,7 @@ Usage:
   -lp       List of parameters in txt file (formato: endpoint: [param1, param2] [count])
   -params   Number of parameters to inject (random sample, clusterbomb)
   -o        Scan options (e.g. -o 1,2,3)
+  -r        Request types: get,post or both (default: get,post)
   
   COMMON OPTIONS:
   -proxy    Proxy address (HTTP proxy supported in raw CRLF check)
@@ -114,12 +119,20 @@ Scan options (-o):
   5 = SSTI
   6 = Path Traversal
   
-Exemplos:
-  # Parameter fuzzing apenas
-  cat urls.txt | ./programa -lp parametros.txt -o 1,2,6 -params 10
+Request types (-r):
+  get       Only GET requests
+  post      Only POST requests
+  get,post  Both GET and POST requests (default)
   
-  # Path + Parameter fuzzing
-  cat urls.txt | ./programa -le paths.txt -paths 5 -lp parametros.txt -o 1,6 -params 5
+Exemplos:
+  # Parameter fuzzing apenas com GET
+  cat urls.txt | ./programa -lp parametros.txt -o 1,2,6 -params 10 -r get
+  
+  # Path + Parameter fuzzing com POST apenas
+  cat urls.txt | ./programa -le paths.txt -paths 5 -lp parametros.txt -o 1,6 -params 5 -r post
+  
+  # Ambos GET e POST (default)
+  cat urls.txt | ./programa -lp parametros.txt -o 1,2 -r get,post
 `)
 	}
 }
@@ -132,6 +145,21 @@ func main() {
 	// Validação básica
 	if paramFile == "" {
 		fmt.Fprintln(os.Stderr, "Erro: -lp é obrigatório (arquivo de parâmetros)")
+		flag.Usage()
+		os.Exit(1)
+	}
+	
+	// Validação do flag -r
+	validRequestTypes := map[string]bool{
+		"get":      true,
+		"post":     true,
+		"get,post": true,
+		"post,get": true,
+	}
+	
+	requestTypes = strings.ToLower(strings.TrimSpace(requestTypes))
+	if !validRequestTypes[requestTypes] {
+		fmt.Fprintln(os.Stderr, "Erro: -r deve ser 'get', 'post' ou 'get,post'")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -549,18 +577,64 @@ type TestCase struct {
 	Detector func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string)
 }
 
+// Estrutura para contar vulnerabilidades por endpoint
+type endpointVulnCounter struct {
+	sync.Mutex
+	count map[string]int
+}
+
+func newEndpointVulnCounter() *endpointVulnCounter {
+	return &endpointVulnCounter{
+		count: make(map[string]int),
+	}
+}
+
+func (c *endpointVulnCounter) increment(endpoint string) bool {
+	c.Lock()
+	defer c.Unlock()
+	
+	current := c.count[endpoint]
+	if current >= MaxVulnsPerEndpoint {
+		return false // Já atingiu o limite
+	}
+	
+	c.count[endpoint] = current + 1
+	return true // Ainda pode testar
+}
+
+func (c *endpointVulnCounter) getCount(endpoint string) int {
+	c.Lock()
+	defer c.Unlock()
+	return c.count[endpoint]
+}
+
+var vulnCounter = newEndpointVulnCounter()
+
+// Função para verificar se deve executar GET
+func shouldDoGET() bool {
+	return strings.Contains(requestTypes, "get")
+}
+
+// Função para verificar se deve executar POST
+func shouldDoPOST() bool {
+	return strings.Contains(requestTypes, "post")
+}
+
 func runAllTests(base string, selectedParams []string) []string {
 	if len(selectedParams) == 0 {
 		return nil // Não mostra mensagem quando não há parâmetros
 	}
 
+	// Extrai endpoint para controle de limite
+	endpoint := normalizeEndpoint(base)
+	
 	client := buildClient()
 
 	tests := []TestCase{
 		{
 			ID:       1,
 			Name:     "XSS",
-			Payloads: []string{`%27%22teste`}, // REMOVIDO: `%3f%26%27%22teste`
+			Payloads: []string{`%27%22teste`},
 			NeedHTML: true,
 			Detector: func(method, urlStr string, resp *http.Response, body []byte, _ string) (bool, string) {
 				if !isHTML(resp) {
@@ -670,42 +744,80 @@ func runAllTests(base string, selectedParams []string) []string {
 	}
 
 	var results []string
+	vulnFound := 0
 
 	for _, tc := range tests {
 		if scanFilter != nil && !scanFilter[tc.ID] {
 			continue
 		}
+		
+		// Verifica se já atingiu o limite para este endpoint
+		if vulnFound >= MaxVulnsPerEndpoint {
+			break // Sai do loop de testes para este endpoint
+		}
+		
 		for _, payload := range tc.Payloads {
-
-			// -------- GET normal (clusterbomb) --------
-			if getURL, ok := addParamsRaw(base, selectedParams, payload); ok {
-				if res := doRequestAndDetect(client, "GET", getURL, tc, ""); res != "" {
-					results = append(results, res)
-				}
+			// Verifica novamente dentro do loop de payloads
+			if vulnFound >= MaxVulnsPerEndpoint {
+				break
 			}
 
-			// -------- REMOVIDO: Traversal para XSS com %27%22teste --------
-			// if tc.ID == 1 && tc.Name == "XSS" && payload == `%27%22teste` {
-			// 	if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
-			// 		if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
-			// 			results = append(results, res)
-			// 		}
-			// 	}
-			// }
-			
-			// -------- Traversal APENAS para Open redirect com payload https://example.com --------
-			if tc.ID == 3 && payload == `https://example.com` {
-				if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
-					if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
+			// -------- GET normal (clusterbomb) --------
+			if shouldDoGET() {
+				if getURL, ok := addParamsRaw(base, selectedParams, payload); ok {
+					// Verifica se ainda pode testar antes de fazer a requisição
+					if !vulnCounter.increment(endpoint) {
+						// Já atingiu o limite para este endpoint
+						return results
+					}
+					
+					if res := doRequestAndDetect(client, "GET", getURL, tc, ""); res != "" {
 						results = append(results, res)
+						vulnFound++
+						
+						// Se atingiu o limite, para de testar
+						if vulnFound >= MaxVulnsPerEndpoint {
+							return results
+						}
+					}
+				}
+
+				// -------- Traversal APENAS para Open redirect com payload https://example.com --------
+				if tc.ID == 3 && payload == `https://example.com` {
+					if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
+						// Verifica se ainda pode testar
+						if !vulnCounter.increment(endpoint) {
+							return results
+						}
+						
+						if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
+							results = append(results, res)
+							vulnFound++
+							
+							if vulnFound >= MaxVulnsPerEndpoint {
+								return results
+							}
+						}
 					}
 				}
 			}
 
 			// -------- POST x-www-form-urlencoded (clusterbomb) --------
-			bodyStr := buildFormBodyRaw(selectedParams, payload)
-			if res := doRequestAndDetect(client, "POST", base, tc, bodyStr); res != "" {
-				results = append(results, res)
+			if shouldDoPOST() {
+				bodyStr := buildFormBodyRaw(selectedParams, payload)
+				// Verifica se ainda pode testar
+				if !vulnCounter.increment(endpoint) {
+					return results
+				}
+				
+				if res := doRequestAndDetect(client, "POST", base, tc, bodyStr); res != "" {
+					results = append(results, res)
+					vulnFound++
+					
+					if vulnFound >= MaxVulnsPerEndpoint {
+						return results
+					}
+				}
 			}
 		}
 	}
