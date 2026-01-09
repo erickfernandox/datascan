@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -26,18 +27,9 @@ const (
 	MaxParamsPerCluster = 80
 	MaxClusters         = 10
 	MaxTotalParams      = MaxParamsPerCluster * MaxClusters
-	MaxVulnsPerEndpoint = 4
 )
 
-// -------------------- Tipos e flags --------------------
-
-type customheaders []string
-
-func (h *customheaders) String() string { return "Custom headers" }
-func (h *customheaders) Set(val string) error {
-	*h = append(*h, val)
-	return nil
-}
+// -------------------- Variáveis Globais --------------------
 
 var (
 	headers       customheaders
@@ -54,14 +46,31 @@ var (
 	workers       int
 	paramMap      map[string][]string
 	endpointList  []string
-	requestTypes  string // Nova flag para escolher tipos de request
+	requestTypes  string
+
+	// Controle de shutdown
+	shutdownChan chan struct{}
+	wg           sync.WaitGroup
 )
 
-// ANSI colors
-const (
-	colorRed   = "\x1b[31m"
-	colorReset = "\x1b[0m"
-)
+type customheaders []string
+
+func (h *customheaders) String() string { return "Custom headers" }
+func (h *customheaders) Set(val string) error {
+	*h = append(*h, val)
+	return nil
+}
+
+// TestCase structure
+type TestCase struct {
+	ID       int
+	Name     string
+	Payloads []string
+	NeedHTML bool
+	Detector func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string)
+}
+
+// -------------------- Inicialização --------------------
 
 func init() {
 	flag.IntVar(&paramCount, "params", 0, "Number of parameters to inject (random sample)")
@@ -86,69 +95,38 @@ func init() {
 	flag.IntVar(&workers, "w", 0, "Workers para processamento paralelo (default: CPUs * 2)")
 	flag.StringVar(&requestTypes, "r", "get,post", "Request types: get,post or both (default: get,post)")
 
-	flag.Usage = func() {
-		fmt.Println(`
-Usage:
-  PARAMETER FUZZING ONLY:
-  -lp       List of parameters in txt file (formato: endpoint: [param1, param2] [count])
-  -params   Number of parameters to inject (random sample, clusterbomb)
-  -o        Scan options (e.g. -o 1,2,3)
-  -r        Request types: get,post or both (default: get,post)
-  
-  PATH + PARAMETER FUZZING:
-  -le       Path to endpoint/path wordlist file
-  -paths    Number of random paths to test per URL
-  -lp       List of parameters in txt file (formato: endpoint: [param1, param2] [count])
-  -params   Number of parameters to inject (random sample, clusterbomb)
-  -o        Scan options (e.g. -o 1,2,3)
-  -r        Request types: get,post or both (default: get,post)
-  
-  COMMON OPTIONS:
-  -proxy    Proxy address (HTTP proxy supported in raw CRLF check)
-  -H        Headers (repeatable)
-  -s        Show only PoC (hide "Not Vulnerable")
-  -html     Only print XSS/Link results if Content-Type is text/html
-  -t        Number of threads (default 50, minimum 15)
-  -w        Workers para processamento paralelo (default: CPUs * 2)
-  
-Scan options (-o):
-  1 = XSS (inclui XSS Script)
-  2 = CRLF Injection
-  3 = Redirect/SSRF + Open Redirect
-  4 = Link Manipulation
-  5 = SSTI
-  6 = Path Traversal
-  
-Request types (-r):
-  get       Only GET requests
-  post      Only POST requests
-  get,post  Both GET and POST requests (default)
-  
-Exemplos:
-  # Parameter fuzzing apenas com GET
-  cat urls.txt | ./programa -lp parametros.txt -o 1,2,6 -params 10 -r get
-  
-  # Path + Parameter fuzzing com POST apenas
-  cat urls.txt | ./programa -le paths.txt -paths 5 -lp parametros.txt -o 1,6 -params 5 -r post
-  
-  # Ambos GET e POST (default)
-  cat urls.txt | ./programa -lp parametros.txt -o 1,2 -r get,post
-`)
-	}
+	shutdownChan = make(chan struct{})
 }
 
 // -------------------- Main --------------------
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "PANIC: %v\n", r)
+		}
+	}()
+
 	flag.Parse()
-	
+
+	// Setup básico
+	setup()
+
+	// Processar URLs
+	processURLs()
+
+	// Aguardar finalização
+	wg.Wait()
+}
+
+func setup() {
 	// Validação básica
 	if paramFile == "" {
 		fmt.Fprintln(os.Stderr, "Erro: -lp é obrigatório (arquivo de parâmetros)")
 		flag.Usage()
 		os.Exit(1)
 	}
-	
+
 	// Validação do flag -r
 	validRequestTypes := map[string]bool{
 		"get":      true,
@@ -156,22 +134,28 @@ func main() {
 		"get,post": true,
 		"post,get": true,
 	}
-	
+
 	requestTypes = strings.ToLower(strings.TrimSpace(requestTypes))
 	if !validRequestTypes[requestTypes] {
 		fmt.Fprintln(os.Stderr, "Erro: -r deve ser 'get', 'post' ou 'get,post'")
 		flag.Usage()
 		os.Exit(1)
 	}
-	
+
 	// Configura workers
 	if workers <= 0 {
-		workers = 2 * runtime.NumCPU()
+		workers = runtime.NumCPU() * 2
 	}
-	
+	if workers > 1000 {
+		workers = 1000
+	}
+
 	// Configura concurrency
 	if concurrency < 15 {
 		concurrency = 15
+	}
+	if concurrency > 500 {
+		concurrency = 500
 	}
 
 	// Parse scan options
@@ -180,14 +164,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Erro: opções de scan inválidas para -o")
 		os.Exit(1)
 	}
-	
+
 	// Carrega parâmetros do arquivo
 	paramMap = loadParamList(paramFile)
 	if len(paramMap) == 0 {
 		fmt.Fprintln(os.Stderr, "Erro: nenhum parâmetro carregado do arquivo")
 		os.Exit(1)
 	}
-	
+
 	// Carrega endpoints para path fuzzing (se especificado)
 	if endpointFile != "" {
 		var err error
@@ -202,435 +186,402 @@ func main() {
 		}
 		rand.Seed(time.Now().UnixNano())
 	}
+}
 
-	// Canais para processamento
-	jobs := make(chan string, 2000)
-	results := make(chan string, 2000)
-	var wg sync.WaitGroup
+func processURLs() {
+	// Canais com buffer limitado
+	jobs := make(chan string, 1000)
+	results := make(chan string, 1000)
 
-	/* ---------- workers para processar URLs ---------- */
+	// Worker para coletar resultados
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		writer := bufio.NewWriter(os.Stdout)
+		defer writer.Flush()
+
+		for result := range results {
+			if result != "" {
+				fmt.Fprintln(writer, result)
+			}
+		}
+	}()
+
+	// Workers para processamento
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for url := range jobs {
-				var vulnResults []string
-				
-				if endpointFile != "" && endpointCount > 0 {
-					// Modo path + parameter fuzzing
-					vulnResults = processPathAndParamFuzzing(url)
-				} else {
-					// Modo parameter fuzzing apenas
-					vulnResults = processURLAndTest(url, paramMap)
-				}
-				
-				for _, result := range vulnResults {
-					if result != "" {
-						results <- result
-					}
-				}
-			}
-		}()
+		go worker(i, jobs, results)
 	}
 
-	/* ---------- closer ---------- */
+	// Reader de stdin
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(jobs)
+
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 1024), 1024*1024*10) // 10MB max
+
+		for scanner.Scan() {
+			select {
+			case <-shutdownChan:
+				return
+			default:
+				line := strings.TrimSpace(scanner.Text())
+				if line != "" {
+					jobs <- line
+				}
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "Erro lendo stdin: %v\n", err)
+		}
+	}()
+
+	// Aguardar finalização dos workers
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
-
-	/* ---------- stdin reader ---------- */
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Buffer(make([]byte, 1024), 1024*1024*50)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				jobs <- line
-			}
-		}
-		close(jobs)
-	}()
-
-	/* ---------- output ---------- */
-	writer := bufio.NewWriter(os.Stdout)
-	defer writer.Flush()
-
-	for r := range results {
-		fmt.Fprintln(writer, r)
-	}
 }
 
-// -------------------- Carregamento de Parâmetros (do algoritmo 1) --------------------
+func worker(id int, jobs <-chan string, results chan<- string) {
+	defer wg.Done()
 
-func loadParamList(file string) map[string][]string {
-	f, err := os.Open(file)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "erro abrindo lp:", err)
-		os.Exit(1)
-	}
-	defer f.Close()
+	// Criar client próprio para cada worker (evita compartilhamento)
+	client := buildClient()
+	defer client.CloseIdleConnections()
 
-	re := regexp.MustCompile(`^([^:]+):\s*\[(.*)\]\s*\[\d+\]$`)
-	out := make(map[string][]string)
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		m := re.FindStringSubmatch(line)
-		if len(m) != 3 {
-			continue
-		}
-		out[m[1]] = splitParams(m[2])
-	}
-	return out
-}
-
-func splitParams(s string) []string {
-	var out []string
-	var buf strings.Builder
-	inQuotes := false
-
-	for _, r := range s {
-		switch r {
-		case '\'':
-			inQuotes = !inQuotes
-		case ',':
-			if !inQuotes {
-				out = append(out, strings.Trim(buf.String(), ` "'`))
-				buf.Reset()
-				continue
-			}
-			buf.WriteRune(r)
+	for urlStr := range jobs {
+		select {
+		case <-shutdownChan:
+			return
 		default:
-			buf.WriteRune(r)
+			var vulnResults []string
+
+			if endpointFile != "" && endpointCount > 0 {
+				vulnResults = processPathAndParamFuzzing(urlStr, client)
+			} else {
+				vulnResults = processURLAndTest(urlStr, paramMap, client)
+			}
+
+			for _, result := range vulnResults {
+				select {
+				case results <- result:
+				case <-shutdownChan:
+					return
+				}
+			}
 		}
 	}
-
-	if buf.Len() > 0 {
-		out = append(out, strings.Trim(buf.String(), ` "'`))
-	}
-	return out
 }
 
-func normalizeEndpoint(u string) string {
-	u = strings.Split(u, "?")[0]
-	base := path.Base(u)
-	if idx := strings.LastIndex(base, "."); idx > 0 {
-		base = base[:idx]
-	}
-	return base
-}
+// -------------------- Funções do Worker --------------------
 
-// -------------------- Processamento de URLs (combina lógica) --------------------
-
-func processURLAndTest(rawURL string, paramMap map[string][]string) []string {
+func processURLAndTest(rawURL string, paramMap map[string][]string, client *http.Client) []string {
 	endpoint := normalizeEndpoint(rawURL)
 	if endpoint == "" {
 		return nil
 	}
 
 	// Consolida parâmetros do endpoint
-	paramSet := make(map[string]struct{})
+	params := getEndpointParams(endpoint, paramMap)
+	if len(params) == 0 {
+		return nil
+	}
+
+	// Limitar parâmetros
+	if paramCount > 0 && paramCount < len(params) {
+		params = selectRandomParams(params, paramCount)
+	}
+	if len(params) > MaxTotalParams {
+		params = params[:MaxTotalParams]
+	}
+
+	// Executar testes
+	return runAllTests(rawURL, params, client)
+}
+
+func getEndpointParams(endpoint string, paramMap map[string][]string) []string {
+	var result []string
+	seen := make(map[string]struct{})
+
 	for key, params := range paramMap {
-		if key == endpoint || strings.Contains(key, endpoint) {
+		if strings.Contains(key, endpoint) {
 			for _, p := range params {
-				paramSet[p] = struct{}{}
+				if _, exists := seen[p]; !exists {
+					seen[p] = struct{}{}
+					result = append(result, p)
+				}
 			}
 		}
 	}
 
-	// Se não encontrar parâmetros, retorna vazio (não mostra mensagem)
-	if len(paramSet) == 0 {
-		return nil
-	}
-
-	// Transforma em slice
-	var allParams []string
-	for p := range paramSet {
-		allParams = append(allParams, p)
-	}
-
-	// Limite global anti-infinito
-	if len(allParams) > MaxTotalParams {
-		allParams = allParams[:MaxTotalParams]
-	}
-
-	// Se paramCount for especificado, usa amostra aleatória
-	var selectedParams []string
-	if paramCount > 0 && paramCount < len(allParams) {
-		selectedParams = getRandomParams(allParams, paramCount)
-	} else {
-		selectedParams = allParams
-	}
-
-	// Executa todos os testes de vulnerabilidade
-	return runAllTests(rawURL, selectedParams)
+	return result
 }
 
-// -------------------- Path + Parameter Fuzzing --------------------
-
-func processPathAndParamFuzzing(baseURL string) []string {
-	// Seleciona endpoints aleatórios
-	selectedEndpoints := getRandomWords(endpointList, endpointCount)
-	
-	var allResults []string
-	
-	for _, endpoint := range selectedEndpoints {
-		// Constrói URL com path
-		pathURL := strings.TrimRight(baseURL, "/") + "/" + endpoint
-		
-		// Para cada path, executa o fuzzing de parâmetros normalmente
-		results := processURLAndTest(pathURL, paramMap)
-		allResults = append(allResults, results...)
-	}
-	
-	return allResults
-}
-
-func getRandomWords(words []string, count int) []string {
-	if count <= 0 || len(words) == 0 {
-		return nil
-	}
-	if count >= len(words) {
-		r := make([]string, len(words))
-		copy(r, words)
-		return r
-	}
-	r := make([]string, len(words))
-	copy(r, words)
-	rand.Shuffle(len(r), func(i, j int) { r[i], r[j] = r[j], r[i] })
-	return r[:count]
-}
-
-func readLines(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines, scanner.Err()
-}
-
-// -------------------- Testes de Vulnerabilidade (do algoritmo 2) --------------------
-
-func getRandomParams(params []string, count int) []string {
+func selectRandomParams(params []string, count int) []string {
 	if count <= 0 || len(params) == 0 {
 		return nil
 	}
 	if count >= len(params) {
-		r := make([]string, len(params))
-		copy(r, params)
-		return r
+		return params
 	}
-	r := make([]string, len(params))
-	copy(r, params)
-	rand.Shuffle(len(r), func(i, j int) { r[i], r[j] = r[j], r[i] })
-	return r[:count]
+
+	// Shuffle parcial mais eficiente
+	result := make([]string, count)
+	for i := 0; i < count; i++ {
+		j := i + rand.Intn(len(params)-i)
+		params[i], params[j] = params[j], params[i]
+		result[i] = params[i]
+	}
+
+	return result
 }
 
-func defaultHeaderMap() map[string]string {
-	return map[string]string{
-		"User-Agent":      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Accept-Encoding": "gzip, deflate, br",
-		"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-		"Connection":      "close",
+func processPathAndParamFuzzing(baseURL string, client *http.Client) []string {
+	if len(endpointList) == 0 || endpointCount <= 0 {
+		return nil
 	}
+
+	// Selecionar endpoints
+	selected := selectRandomEndpoints(endpointCount)
+
+	var allResults []string
+	for _, endpoint := range selected {
+		pathURL := strings.TrimRight(baseURL, "/") + "/" + endpoint
+		results := processURLAndTest(pathURL, paramMap, client)
+		allResults = append(allResults, results...)
+	}
+
+	return allResults
 }
 
-func userHeaderMap(h customheaders) map[string]string {
-	m := make(map[string]string)
-	for _, raw := range h {
-		parts := strings.SplitN(raw, ":", 2)
-		if len(parts) != 2 {
+func selectRandomEndpoints(count int) []string {
+	if count <= 0 || len(endpointList) == 0 {
+		return nil
+	}
+	if count >= len(endpointList) {
+		return endpointList
+	}
+
+	result := make([]string, count)
+	for i := 0; i < count; i++ {
+		j := i + rand.Intn(len(endpointList)-i)
+		endpointList[i], endpointList[j] = endpointList[j], endpointList[i]
+		result[i] = endpointList[i]
+	}
+
+	return result
+}
+
+// -------------------- Testes de Vulnerabilidade --------------------
+
+func runAllTests(baseURL string, params []string, client *http.Client) []string {
+	if len(params) == 0 {
+		return nil
+	}
+
+	var results []string
+
+	tests := getTestCases()
+
+	for _, tc := range tests {
+		if scanFilter != nil && !scanFilter[tc.ID] {
 			continue
 		}
-		k := strings.TrimSpace(parts[0])
-		v := strings.TrimSpace(parts[1])
-		if k != "" {
-			m[http.CanonicalHeaderKey(k)] = v
+
+		for _, payload := range tc.Payloads {
+			// GET requests
+			if shouldDoGET() {
+				// Teste GET normal
+				if getURL, ok := buildGetURL(baseURL, params, payload); ok {
+					if res := doRequest(client, "GET", getURL, tc, ""); res != "" {
+						results = append(results, res)
+					}
+				}
+			}
+
+			// POST requests
+			if shouldDoPOST() {
+				body := buildFormBody(params, payload)
+				if res := doRequest(client, "POST", baseURL, tc, body); res != "" {
+					results = append(results, res)
+				}
+			}
 		}
 	}
-	return m
+
+	return results
 }
 
-func mergeHeaders(base, override map[string]string) map[string]string {
-	out := make(map[string]string, len(base)+len(override))
-	for k, v := range base {
-		out[k] = v
+func buildGetURL(baseURL string, params []string, payload string) (string, bool) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", false
 	}
-	for k, v := range override {
-		out[k] = v
+
+	query := buildQuery(params, payload)
+	if u.RawQuery != "" {
+		u.RawQuery = u.RawQuery + "&" + query
+	} else {
+		u.RawQuery = query
 	}
-	return out
+
+	return u.String(), true
+}
+
+func buildQuery(params []string, value string) string {
+	if len(params) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	// Estimativa de tamanho
+	b.Grow(len(params) * (len(value) + 20))
+
+	for i, p := range params {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(url.QueryEscape(p))
+		b.WriteByte('=')
+		b.WriteString(value)
+	}
+
+	return b.String()
+}
+
+func buildFormBody(params []string, value string) string {
+	return buildQuery(params, value)
+}
+
+// -------------------- Request e Detecção --------------------
+
+func doRequest(client *http.Client, method, urlStr string, tc TestCase, body string) string {
+	var req *http.Request
+	var err error
+
+	if method == "POST" {
+		req, err = http.NewRequest("POST", urlStr, strings.NewReader(body))
+		if err != nil {
+			return ""
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	} else {
+		req, err = http.NewRequest("GET", urlStr, nil)
+		if err != nil {
+			return ""
+		}
+	}
+
+	// Headers mínimos para performance
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	if len(headers) > 0 {
+		for _, h := range headers {
+			if parts := strings.SplitN(h, ":", 2); len(parts) == 2 {
+				req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+			}
+		}
+	}
+
+	// Timeout mais curto
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	// Ler body de forma eficiente
+	var respBody []byte
+	if tc.NeedHTML {
+		if !isHTML(resp) {
+			return ""
+		}
+		respBody, _ = readBody(resp, 512*1024) // 512KB max para HTML
+	} else {
+		respBody, _ = readBody(resp, 64*1024) // 64KB max para outros
+	}
+
+	vuln, detail := tc.Detector(method, urlStr, resp, respBody, body)
+	if vuln {
+		return formatVuln(tc.Name, method, urlStr, detail)
+	}
+
+	if !onlyPOC {
+		return formatNotVuln(tc.Name, method, urlStr)
+	}
+
+	return ""
+}
+
+func readBody(resp *http.Response, maxBytes int64) ([]byte, error) {
+	// Usar io.LimitReader para evitar ler muito
+	limitedReader := io.LimitReader(resp.Body, maxBytes)
+	return io.ReadAll(limitedReader)
+}
+
+// -------------------- Funções Auxiliares --------------------
+
+func shouldDoGET() bool {
+	return strings.Contains(requestTypes, "get")
+}
+
+func shouldDoPOST() bool {
+	return strings.Contains(requestTypes, "post")
+}
+
+func normalizeEndpoint(u string) string {
+	// Método rápido
+	if idx := strings.Index(u, "?"); idx != -1 {
+		u = u[:idx]
+	}
+
+	base := path.Base(u)
+	if idx := strings.LastIndex(base, "."); idx > 0 {
+		base = base[:idx]
+	}
+
+	return base
 }
 
 func buildClient() *http.Client {
 	tr := &http.Transport{
-		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
-		DialContext:        (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
-		DisableCompression: true,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        concurrency * 2,
+		MaxIdleConnsPerHost: concurrency,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
 	}
+
 	if proxy != "" {
 		if p, err := url.Parse(proxy); err == nil {
 			tr.Proxy = http.ProxyURL(p)
 		}
 	}
+
 	return &http.Client{
 		Transport: tr,
 		Timeout:   8 * time.Second,
 	}
 }
 
-func applyHeaders(req *http.Request) {
-	base := defaultHeaderMap()
-	user := userHeaderMap(headers)
-	final := mergeHeaders(base, user)
-	for k, v := range final {
-		req.Header.Set(k, v)
-	}
-}
+// -------------------- Test Cases --------------------
 
-func buildQueryRaw(params []string, rawValue string) string {
-	var b strings.Builder
-	for i, p := range params {
-		if i > 0 {
-			b.WriteByte('&')
-		}
-		b.WriteString(url.QueryEscape(p))
-		b.WriteByte('=')
-		b.WriteString(rawValue)
-	}
-	return b.String()
-}
-
-func buildFormBodyRaw(params []string, rawValue string) string {
-	var b strings.Builder
-	for i, p := range params {
-		if i > 0 {
-			b.WriteByte('&')
-		}
-		b.WriteString(url.QueryEscape(p))
-		b.WriteByte('=')
-		b.WriteString(rawValue)
-	}
-	return b.String()
-}
-
-// GET normal com clusterbomb
-func addParamsRaw(baseURL string, params []string, rawValue string) (string, bool) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return "", false
-	}
-	u.RawQuery = buildQueryRaw(params, rawValue)
-	return u.String(), true
-}
-
-// Traversal genérico: /%2e%2e%2f?<clusterbomb>
-func addTraversalAndParamsRaw(baseURL string, params []string, rawValue string) (string, bool) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		u2, err2 := url.Parse("http://" + baseURL)
-		if err2 != nil {
-			return "", false
-		}
-		u = u2
-	}
-
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	host := u.Host
-	if host == "" {
-		return "", false
-	}
-
-	query := buildQueryRaw(params, rawValue)
-	path := "/%2e%2e%2f"
-
-	if query != "" {
-		return fmt.Sprintf("%s://%s%s?%s", scheme, host, path, query), true
-	}
-	return fmt.Sprintf("%s://%s%s", scheme, host, path), true
-}
-
-type TestCase struct {
-	ID       int
-	Name     string
-	Payloads []string
-	NeedHTML bool
-	Detector func(method, urlStr string, resp *http.Response, body []byte, sentBody string) (bool, string)
-}
-
-// Estrutura para contar vulnerabilidades por endpoint
-type endpointVulnCounter struct {
-	sync.Mutex
-	count map[string]int
-}
-
-func newEndpointVulnCounter() *endpointVulnCounter {
-	return &endpointVulnCounter{
-		count: make(map[string]int),
-	}
-}
-
-func (c *endpointVulnCounter) increment(endpoint string) bool {
-	c.Lock()
-	defer c.Unlock()
-	
-	current := c.count[endpoint]
-	if current >= MaxVulnsPerEndpoint {
-		return false // Já atingiu o limite
-	}
-	
-	c.count[endpoint] = current + 1
-	return true // Ainda pode testar
-}
-
-func (c *endpointVulnCounter) getCount(endpoint string) int {
-	c.Lock()
-	defer c.Unlock()
-	return c.count[endpoint]
-}
-
-var vulnCounter = newEndpointVulnCounter()
-
-// Função para verificar se deve executar GET
-func shouldDoGET() bool {
-	return strings.Contains(requestTypes, "get")
-}
-
-// Função para verificar se deve executar POST
-func shouldDoPOST() bool {
-	return strings.Contains(requestTypes, "post")
-}
-
-func runAllTests(base string, selectedParams []string) []string {
-	if len(selectedParams) == 0 {
-		return nil // Não mostra mensagem quando não há parâmetros
-	}
-
-	// Extrai endpoint para controle de limite
-	endpoint := normalizeEndpoint(base)
-	
-	client := buildClient()
-
-	tests := []TestCase{
+func getTestCases() []TestCase {
+	return []TestCase{
 		{
 			ID:       1,
 			Name:     "XSS",
@@ -742,152 +693,6 @@ func runAllTests(base string, selectedParams []string) []string {
 			},
 		},
 	}
-
-	var results []string
-	vulnFound := 0
-
-	for _, tc := range tests {
-		if scanFilter != nil && !scanFilter[tc.ID] {
-			continue
-		}
-		
-		// Verifica se já atingiu o limite para este endpoint
-		if vulnFound >= MaxVulnsPerEndpoint {
-			break // Sai do loop de testes para este endpoint
-		}
-		
-		for _, payload := range tc.Payloads {
-			// Verifica novamente dentro do loop de payloads
-			if vulnFound >= MaxVulnsPerEndpoint {
-				break
-			}
-
-			// -------- GET normal (clusterbomb) --------
-			if shouldDoGET() {
-				if getURL, ok := addParamsRaw(base, selectedParams, payload); ok {
-					// Verifica se ainda pode testar antes de fazer a requisição
-					if !vulnCounter.increment(endpoint) {
-						// Já atingiu o limite para este endpoint
-						return results
-					}
-					
-					if res := doRequestAndDetect(client, "GET", getURL, tc, ""); res != "" {
-						results = append(results, res)
-						vulnFound++
-						
-						// Se atingiu o limite, para de testar
-						if vulnFound >= MaxVulnsPerEndpoint {
-							return results
-						}
-					}
-				}
-
-				// -------- Traversal APENAS para Open redirect com payload https://example.com --------
-				if tc.ID == 3 && payload == `https://example.com` {
-					if travURL, ok := addTraversalAndParamsRaw(base, selectedParams, payload); ok {
-						// Verifica se ainda pode testar
-						if !vulnCounter.increment(endpoint) {
-							return results
-						}
-						
-						if res := doRequestAndDetect(client, "GET", travURL, tc, ""); res != "" {
-							results = append(results, res)
-							vulnFound++
-							
-							if vulnFound >= MaxVulnsPerEndpoint {
-								return results
-							}
-						}
-					}
-				}
-			}
-
-			// -------- POST x-www-form-urlencoded (clusterbomb) --------
-			if shouldDoPOST() {
-				bodyStr := buildFormBodyRaw(selectedParams, payload)
-				// Verifica se ainda pode testar
-				if !vulnCounter.increment(endpoint) {
-					return results
-				}
-				
-				if res := doRequestAndDetect(client, "POST", base, tc, bodyStr); res != "" {
-					results = append(results, res)
-					vulnFound++
-					
-					if vulnFound >= MaxVulnsPerEndpoint {
-						return results
-					}
-				}
-			}
-		}
-	}
-
-	return results
-}
-
-// -------------------- doRequestAndDetect --------------------
-
-func doRequestAndDetect(client *http.Client, method, fullURL string, tc TestCase, extraBody string) string {
-	var req *http.Request
-	var err error
-
-	if method == "POST" {
-		req, err = http.NewRequest("POST", fullURL, strings.NewReader(extraBody))
-		if err != nil {
-			return ""
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	} else {
-		req, err = http.NewRequest("GET", fullURL, nil)
-		if err != nil {
-			return ""
-		}
-	}
-
-	applyHeaders(req)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return ""
-	}
-	body, _ := readBodyDecodedLimit(resp, 2<<20)
-	resp.Body.Close()
-
-	if tc.NeedHTML && !isHTML(resp) {
-		return ""
-	}
-	if htmlOnly && tc.NeedHTML && !isHTML(resp) {
-		return ""
-	}
-
-	sentBody := ""
-	if method == "POST" {
-		sentBody = extraBody
-	}
-
-	vul, det := tc.Detector(method, fullURL, resp, body, sentBody)
-
-	if vul {
-		// Vulnerável - em vermelho
-		if method == "POST" && sentBody != "" {
-			if det != "" {
-				det += " "
-			}
-			det += "[body:" + sentBody + "]"
-		}
-		return formatVuln(tc.Name, method, fullURL, det)
-	}
-
-	// Não vulnerável - normal (sem cor)
-	if !onlyPOC {
-		msg := formatNotVuln(tc.Name, method, fullURL)
-		if method == "POST" && sentBody != "" {
-			msg += " [body:" + sentBody + "]"
-		}
-		return msg
-	}
-
-	return ""
 }
 
 // -------------------- CRLF raw --------------------
@@ -1039,33 +844,84 @@ func fetchRawResponseHead(method, fullURL, body string, addHeaders customheaders
 	return readHead(conn, "", true)
 }
 
-// -------------------- Auxiliares --------------------
+// -------------------- Funções Restantes --------------------
 
-func isHTML(resp *http.Response) bool {
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	return strings.Contains(ct, "text/html")
-}
-
-func readBodyDecodedLimit(resp *http.Response, max int64) ([]byte, error) {
-	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
-	var r io.Reader = io.LimitReader(resp.Body, max)
-
-	switch enc {
-	case "gzip":
-		gr, err := gzip.NewReader(io.LimitReader(resp.Body, max))
-		if err != nil {
-			return io.ReadAll(r)
-		}
-		defer gr.Close()
-		return io.ReadAll(gr)
-	case "deflate":
-		fr := flate.NewReader(io.LimitReader(resp.Body, max))
-		defer fr.Close()
-		return io.ReadAll(fr)
-	default:
-		return io.ReadAll(r)
+func loadParamList(file string) map[string][]string {
+	f, err := os.Open(file)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "erro abrindo lp:", err)
+		os.Exit(1)
 	}
+	defer f.Close()
+
+	re := regexp.MustCompile(`^([^:]+):\s*\[(.*)\]\s*\[\d+\]$`)
+	out := make(map[string][]string)
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		m := re.FindStringSubmatch(line)
+		if len(m) != 3 {
+			continue
+		}
+		out[m[1]] = splitParams(m[2])
+	}
+	return out
 }
+
+func splitParams(s string) []string {
+	var out []string
+	var buf strings.Builder
+	inQuotes := false
+
+	for _, r := range s {
+		switch r {
+		case '\'':
+			inQuotes = !inQuotes
+		case ',':
+			if !inQuotes {
+				out = append(out, strings.Trim(buf.String(), ` "'`))
+				buf.Reset()
+				continue
+			}
+			buf.WriteRune(r)
+		default:
+			buf.WriteRune(r)
+		}
+	}
+
+	if buf.Len() > 0 {
+		out = append(out, strings.Trim(buf.String(), ` "'`))
+	}
+	return out
+}
+
+func readLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, scanner.Err()
+}
+
+// ANSI colors
+const (
+	colorRed   = "\x1b[31m"
+	colorReset = "\x1b[0m"
+)
 
 func formatVuln(kind, method, urlStr, detail string) string {
 	// Vulnerável - em vermelho
@@ -1108,7 +964,31 @@ func parseScanOptions(opt string) map[int]bool {
 	return m
 }
 
-// -------------------- Link Manipulation --------------------
+func isHTML(resp *http.Response) bool {
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	return strings.Contains(ct, "text/html")
+}
+
+func readBodyDecodedLimit(resp *http.Response, max int64) ([]byte, error) {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	var r io.Reader = io.LimitReader(resp.Body, max)
+
+	switch enc {
+	case "gzip":
+		gr, err := gzip.NewReader(io.LimitReader(resp.Body, max))
+		if err != nil {
+			return io.ReadAll(r)
+		}
+		defer gr.Close()
+		return io.ReadAll(gr)
+	case "deflate":
+		fr := flate.NewReader(io.LimitReader(resp.Body, max))
+		defer fr.Close()
+		return io.ReadAll(fr)
+	default:
+		return io.ReadAll(r)
+	}
+}
 
 func linkManipulationMatch(body []byte, domain string) (bool, string) {
 	low := strings.ToLower(string(body))
@@ -1141,4 +1021,41 @@ func linkManipulationMatch(body []byte, domain string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+func defaultHeaderMap() map[string]string {
+	return map[string]string{
+		"User-Agent":      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Encoding": "gzip, deflate, br",
+		"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+		"Connection":      "close",
+	}
+}
+
+func userHeaderMap(h customheaders) map[string]string {
+	m := make(map[string]string)
+	for _, raw := range h {
+		parts := strings.SplitN(raw, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		if k != "" {
+			m[http.CanonicalHeaderKey(k)] = v
+		}
+	}
+	return m
+}
+
+func mergeHeaders(base, override map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
 }
